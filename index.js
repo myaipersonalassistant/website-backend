@@ -1,7 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-require('dotenv').config();
+// Only load dotenv in local development (Vercel provides env vars automatically)
+if (process.env.NODE_ENV !== 'production') {
+  try {
+    require('dotenv').config();
+  } catch (e) {
+    // dotenv not available, that's okay
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -87,14 +94,23 @@ if (admin.apps.length === 0) {
     console.error('   - FIREBASE_SERVICE_ACCOUNT_KEY (JSON string, legacy)');
     console.error('   - GOOGLE_APPLICATION_CREDENTIALS (file path)');
     console.error('   - FIREBASE_PROJECT_ID with FIREBASE_PRIVATE_KEY and FIREBASE_CLIENT_EMAIL');
-    throw error;
+    // Don't throw - allow serverless function to initialize even if Firebase fails
+    console.warn('⚠️  Firebase initialization failed, but serverless function will continue');
   }
 } else {
   console.log('✅ Firebase Admin already initialized');
 }
 
-// Initialize Firestore
-const db = admin.firestore();
+// Initialize Firestore (will be null if Firebase init failed)
+let db = null;
+try {
+  if (admin.apps.length > 0) {
+    db = admin.firestore();
+  }
+} catch (error) {
+  console.error('❌ Error initializing Firestore:', error.message);
+  console.warn('⚠️  Firestore not available, but serverless function will continue');
+}
 
 // ============================================
 // API USAGE TRACKING & RATE LIMITING
@@ -2911,14 +2927,12 @@ app.use((err, req, res, next) => {
 });
 
 // ============================================
-// START SERVER
+// EXPORT FOR VERCEL SERVERLESS FUNCTION
 // ============================================
 
-app.listen(PORT, () => {
-  console.log(`🚀 MAI-PA API Server running on port ${PORT}`);
-  console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`🔐 Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+// Export the Express app for Vercel
+// Vercel will handle HTTP requests and route them to this app
+module.exports = app;
 
 // ============================================
 // NOTES FOR IMPLEMENTATION
