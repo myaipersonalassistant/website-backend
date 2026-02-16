@@ -193,12 +193,24 @@ function cleanupRecentActivity() {
   }
 }
 
-// Run cleanup every hour
-setInterval(() => {
-  cleanupOldDailyUsage();
-  cleanupOldMonthlyUsage();
-  cleanupRecentActivity();
-}, 60 * 60 * 1000);
+// Note: In serverless environments (Vercel), setInterval doesn't work
+// Cleanup will happen on-demand during API calls to prevent memory bloat
+// For scheduled cleanup, use Vercel cron jobs or trigger cleanup endpoint periodically
+
+// Helper function to run cleanup occasionally (called during API requests)
+function maybeRunCleanup() {
+  // Run cleanup ~1% of the time to prevent memory bloat
+  if (Math.random() < 0.01) {
+    try {
+      cleanupOldDailyUsage();
+      cleanupOldMonthlyUsage();
+      cleanupRecentActivity();
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+      // Don't throw - cleanup failures shouldn't break API calls
+    }
+  }
+}
 
 // Rate limit configuration per plan
 const RATE_LIMITS = {
@@ -261,6 +273,9 @@ async function getUserPlan(userId) {
 // Helper function to check rate limits (using in-memory storage)
 async function checkRateLimit(userId, apiType) {
   try {
+    // Run cleanup occasionally to prevent memory bloat
+    maybeRunCleanup();
+    
     const planId = await getUserPlan(userId);
     const limits = RATE_LIMITS[planId] || RATE_LIMITS.student;
     const apiLimits = limits[apiType] || limits.deepseek;
@@ -3544,6 +3559,40 @@ app.post('/api/notifications/send-scheduled', async (req, res) => {
 });
 
 // ============================================
+// CLEANUP ENDPOINT (for cron jobs)
+// ============================================
+
+/**
+ * POST /api/cleanup
+ * Cleanup old API usage data (can be called by cron job)
+ */
+app.post('/api/cleanup', async (req, res) => {
+  try {
+    // Optional: Add API key authentication for cron jobs
+    const apiKey = req.headers['x-api-key'];
+    if (process.env.CRON_API_KEY && apiKey !== process.env.CRON_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    cleanupOldDailyUsage();
+    cleanupOldMonthlyUsage();
+    cleanupRecentActivity();
+
+    res.json({
+      success: true,
+      message: 'Cleanup completed',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error in cleanup:', error);
+    res.status(500).json({ 
+      error: 'Cleanup failed', 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 
@@ -3574,3 +3623,80 @@ app.use((err, req, res, next) => {
 // Export the Express app for Vercel
 // Vercel will handle HTTP requests and route them to this app
 module.exports = app;
+
+// ============================================
+// NOTES FOR IMPLEMENTATION
+// ============================================
+
+/**
+ * FIRESTORE SETUP:
+ * 
+ * ✅ Notifications are now using Firestore!
+ * 
+ * 1. Firestore Indexes Required:
+ *    You may need to create composite indexes in Firebase Console for these queries:
+ *    - Collection: notifications
+ *      - Fields: userId (Ascending), is_archived (Ascending), created_at (Descending)
+ *    - Collection: notifications
+ *      - Fields: userId (Ascending), is_read (Ascending), is_archived (Ascending)
+ *    - Collection: notifications
+ *      - Fields: userId (Ascending), is_archived (Ascending), created_at (Descending)
+ * 
+ *    If you get an index error, Firebase will provide a direct link to create it.
+ * 
+ * 2. Firestore Security Rules:
+ *    Make sure your Firestore security rules allow the service account to read/write:
+ *    (The service account bypasses security rules, but you should still set proper rules for client access)
+ * 
+ * 3. Other Collections (Calendar, Tasks, etc.):
+ *    Currently using in-memory arrays. To migrate to Firestore:
+ *    - Follow the same pattern as notifications
+ *    - Use db.collection('collectionName') instead of arrays
+ *    - Use Firestore queries (where, orderBy, limit) instead of array filters
+ *    - Use batch operations for bulk updates
+ * 
+ * 4. Data Validation:
+ *    Consider adding validation using libraries like Joi or Yup before saving to Firestore
+ * 
+ * 5. Pagination:
+ *    For large datasets, implement pagination using Firestore's startAfter() and limit()
+ * 
+ * EMAIL PROCESSING:
+ * 
+ * 1. Integrate with email providers (Gmail, Outlook, etc.) using their APIs
+ * 
+ * 2. Use AI/ML service to extract events, reminders, and tasks from emails:
+ *    - OpenAI GPT-4
+ *    - Google Cloud AI
+ *    - Custom NLP models
+ * 
+ * 3. Set up webhooks or polling to process new emails
+ * 
+ * NOTIFICATIONS:
+ * 
+ * 1. Implement real-time notifications using WebSockets or Server-Sent Events
+ * 
+ * 2. Add push notification support for mobile apps
+ * 
+ * 3. Create notification templates for different types
+ * 
+ * SECURITY:
+ * 
+ * 1. Add rate limiting (use express-rate-limit)
+ * 
+ * 2. Implement request validation
+ * 
+ * 3. Add CORS configuration for production
+ * 
+ * 4. Use HTTPS in production
+ * 
+ * 5. Add logging and monitoring (Winston, Morgan)
+ * 
+ * TESTING:
+ * 
+ * 1. Add unit tests (Jest)
+ * 
+ * 2. Add integration tests
+ * 
+ * 3. Add API documentation (Swagger/OpenAPI)
+ */
