@@ -3135,9 +3135,20 @@ app.post('/api/chat', verifyToken, async (req, res) => {
     }
 
     // Check rate limits
-    const rateLimitError = await checkRateLimit(userId, 'deepseek');
-    if (rateLimitError) {
-      return res.status(429).json(rateLimitError);
+    const rateLimitCheck = await checkRateLimit(userId, 'deepseek');
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        message: rateLimitCheck.dailyExceeded 
+          ? `Daily limit of ${rateLimitCheck.dailyLimit} requests exceeded. You have used ${rateLimitCheck.dailyCount} requests today.`
+          : `Monthly limit of ${rateLimitCheck.monthlyLimit} requests exceeded. You have used ${rateLimitCheck.monthlyCount} requests this month.`,
+        limit: rateLimitCheck.dailyExceeded ? rateLimitCheck.dailyLimit : rateLimitCheck.monthlyLimit,
+        used: rateLimitCheck.dailyExceeded ? rateLimitCheck.dailyCount : rateLimitCheck.monthlyCount,
+        planId: rateLimitCheck.planId,
+        resetTime: rateLimitCheck.dailyExceeded 
+          ? new Date(new Date().setHours(24, 0, 0, 0)).toISOString()
+          : new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).toISOString()
+      });
     }
 
     // Get Deepseek API key
@@ -3213,13 +3224,15 @@ app.post('/api/chat', verifyToken, async (req, res) => {
     const assistantMessage = data.choices?.[0]?.message?.content || 'I apologize, but I could not generate a response.';
 
     // Record API usage
-    await recordAPIUsage(userId, 'deepseek', {
-      endpoint: '/api/chat',
-      conversationId: conversationId || null,
-      inputTokens: data.usage?.prompt_tokens || 0,
-      outputTokens: data.usage?.completion_tokens || 0,
-      totalTokens: data.usage?.total_tokens || 0
-    });
+    await recordAPIUsage(
+      userId, 
+      'deepseek', 
+      true, // success
+      false, // blocked
+      false, // rateLimitExceeded
+      null, // responseTime (not tracked for chat)
+      null // requestSize (not tracked for chat)
+    );
 
     res.json({ 
       message: assistantMessage,
@@ -3258,9 +3271,20 @@ app.post('/api/tts', verifyToken, async (req, res) => {
     }
 
     // Check rate limits
-    const rateLimitError = await checkRateLimit(userId, 'elevenlabs');
-    if (rateLimitError) {
-      return res.status(429).json(rateLimitError);
+    const rateLimitCheck = await checkRateLimit(userId, 'elevenlabs');
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        message: rateLimitCheck.dailyExceeded 
+          ? `Daily limit of ${rateLimitCheck.dailyLimit} requests exceeded. You have used ${rateLimitCheck.dailyCount} requests today.`
+          : `Monthly limit of ${rateLimitCheck.monthlyLimit} requests exceeded. You have used ${rateLimitCheck.monthlyCount} requests this month.`,
+        limit: rateLimitCheck.dailyExceeded ? rateLimitCheck.dailyLimit : rateLimitCheck.monthlyLimit,
+        used: rateLimitCheck.dailyExceeded ? rateLimitCheck.dailyCount : rateLimitCheck.monthlyCount,
+        planId: rateLimitCheck.planId,
+        resetTime: rateLimitCheck.dailyExceeded 
+          ? new Date(new Date().setHours(24, 0, 0, 0)).toISOString()
+          : new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).toISOString()
+      });
     }
 
     // Get ElevenLabs API key
@@ -3304,12 +3328,15 @@ app.post('/api/tts', verifyToken, async (req, res) => {
     const audioDataUrl = `data:audio/mpeg;base64,${audioBase64}`;
 
     // Record API usage
-    await recordAPIUsage(userId, 'elevenlabs', {
-      endpoint: '/api/tts',
-      voiceId: voiceId,
-      textLength: text.length,
-      audioSize: audioBuffer.byteLength
-    });
+    await recordAPIUsage(
+      userId, 
+      'elevenlabs', 
+      true, // success
+      false, // blocked
+      false, // rateLimitExceeded
+      null, // responseTime (not tracked for TTS)
+      audioBuffer.byteLength // requestSize (audio size)
+    );
 
     res.json({ 
       audio: audioDataUrl,
@@ -3547,80 +3574,3 @@ app.use((err, req, res, next) => {
 // Export the Express app for Vercel
 // Vercel will handle HTTP requests and route them to this app
 module.exports = app;
-
-// ============================================
-// NOTES FOR IMPLEMENTATION
-// ============================================
-
-/**
- * FIRESTORE SETUP:
- * 
- * ✅ Notifications are now using Firestore!
- * 
- * 1. Firestore Indexes Required:
- *    You may need to create composite indexes in Firebase Console for these queries:
- *    - Collection: notifications
- *      - Fields: userId (Ascending), is_archived (Ascending), created_at (Descending)
- *    - Collection: notifications
- *      - Fields: userId (Ascending), is_read (Ascending), is_archived (Ascending)
- *    - Collection: notifications
- *      - Fields: userId (Ascending), is_archived (Ascending), created_at (Descending)
- * 
- *    If you get an index error, Firebase will provide a direct link to create it.
- * 
- * 2. Firestore Security Rules:
- *    Make sure your Firestore security rules allow the service account to read/write:
- *    (The service account bypasses security rules, but you should still set proper rules for client access)
- * 
- * 3. Other Collections (Calendar, Tasks, etc.):
- *    Currently using in-memory arrays. To migrate to Firestore:
- *    - Follow the same pattern as notifications
- *    - Use db.collection('collectionName') instead of arrays
- *    - Use Firestore queries (where, orderBy, limit) instead of array filters
- *    - Use batch operations for bulk updates
- * 
- * 4. Data Validation:
- *    Consider adding validation using libraries like Joi or Yup before saving to Firestore
- * 
- * 5. Pagination:
- *    For large datasets, implement pagination using Firestore's startAfter() and limit()
- * 
- * EMAIL PROCESSING:
- * 
- * 1. Integrate with email providers (Gmail, Outlook, etc.) using their APIs
- * 
- * 2. Use AI/ML service to extract events, reminders, and tasks from emails:
- *    - OpenAI GPT-4
- *    - Google Cloud AI
- *    - Custom NLP models
- * 
- * 3. Set up webhooks or polling to process new emails
- * 
- * NOTIFICATIONS:
- * 
- * 1. Implement real-time notifications using WebSockets or Server-Sent Events
- * 
- * 2. Add push notification support for mobile apps
- * 
- * 3. Create notification templates for different types
- * 
- * SECURITY:
- * 
- * 1. Add rate limiting (use express-rate-limit)
- * 
- * 2. Implement request validation
- * 
- * 3. Add CORS configuration for production
- * 
- * 4. Use HTTPS in production
- * 
- * 5. Add logging and monitoring (Winston, Morgan)
- * 
- * TESTING:
- * 
- * 1. Add unit tests (Jest)
- * 
- * 2. Add integration tests
- * 
- * 3. Add API documentation (Swagger/OpenAPI)
- */
