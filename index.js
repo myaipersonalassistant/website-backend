@@ -1,6 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+// web-push for sending push notifications
+let webpush = null;
+try {
+  webpush = require('web-push');
+} catch (e) {
+  console.warn('web-push not installed. Push notifications will not work. Install with: npm install web-push');
+}
 // Only load dotenv in local development (Vercel provides env vars automatically)
 if (process.env.NODE_ENV !== 'production') {
   try {
@@ -110,6 +117,24 @@ try {
 } catch (error) {
   console.error('❌ Error initializing Firestore:', error.message);
   console.warn('⚠️  Firestore not available, but serverless function will continue');
+}
+
+// Initialize web-push for push notifications
+if (webpush) {
+  const vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
+  const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
+  const vapidEmail = process.env.VAPID_EMAIL || 'mailto:admin@mai-pa.com';
+  
+  if (vapidPublicKey && vapidPrivateKey) {
+    webpush.setVapidDetails(
+      vapidEmail,
+      vapidPublicKey,
+      vapidPrivateKey
+    );
+    console.log('✅ Web Push initialized with VAPID keys');
+  } else {
+    console.warn('⚠️  VAPID keys not configured. Push notifications will not work.');
+  }
 }
 
 // ============================================
@@ -2899,6 +2924,595 @@ app.post('/api/api-usage/record', verifyToken, async (req, res) => {
     console.error('Error recording usage:', error);
     // Don't fail the request if recording fails
     res.json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// PUSH NOTIFICATION SUBSCRIPTION ENDPOINTS
+// ============================================
+
+/**
+ * POST /api/push/subscribe
+ * Save push notification subscription for a user
+ */
+app.post('/api/push/subscribe', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { subscription } = req.body;
+
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ 
+        error: 'Invalid subscription',
+        message: 'Subscription data is required' 
+      });
+    }
+
+    // Save subscription to Firestore
+    const subscriptionId = subscription.endpoint.split('/').pop() || 'default';
+    await db.collection('users').doc(userId)
+      .collection('push_subscriptions').doc(subscriptionId)
+      .set({
+        endpoint: subscription.endpoint,
+        keys: subscription.keys,
+        userId: userId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+    res.json({ 
+      success: true,
+      message: 'Push subscription saved successfully' 
+    });
+  } catch (error) {
+    console.error('Error saving push subscription:', error);
+    res.status(500).json({ 
+      error: 'Failed to save subscription', 
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * DELETE /api/push/unsubscribe
+ * Remove push notification subscription for a user
+ */
+app.delete('/api/push/unsubscribe', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { endpoint } = req.body;
+
+    if (!endpoint) {
+      return res.status(400).json({ 
+        error: 'Invalid request',
+        message: 'Endpoint is required' 
+      });
+    }
+
+    const subscriptionId = endpoint.split('/').pop() || 'default';
+    await db.collection('users').doc(userId)
+      .collection('push_subscriptions').doc(subscriptionId)
+      .delete();
+
+    res.json({ 
+      success: true,
+      message: 'Push subscription removed successfully' 
+    });
+  } catch (error) {
+    console.error('Error removing push subscription:', error);
+    res.status(500).json({ 
+      error: 'Failed to remove subscription', 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
+// ACTIVITY NOTIFICATIONS ENDPOINT
+// ============================================
+
+/**
+ * GET /api/activities/upcoming
+ * Get upcoming activities for a user (for notification scheduling)
+ * This endpoint can be called periodically to check for activities that need notifications
+ */
+app.get('/api/activities/upcoming', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { minutesAhead = 5 } = req.query; // Default: check next 5 minutes
+    
+    const now = new Date();
+    const futureTime = new Date(now.getTime() + parseInt(minutesAhead) * 60 * 1000);
+    const nowTimestamp = admin.firestore.Timestamp.fromDate(now);
+    const futureTimestamp = admin.firestore.Timestamp.fromDate(futureTime);
+    
+    const upcomingActivities = [];
+    
+    // Get upcoming events
+    try {
+      const eventsQuery = db.collection('events')
+        .where('userId', '==', userId)
+        .where('start_time', '>=', nowTimestamp)
+        .where('start_time', '<=', futureTimestamp);
+      const eventsSnapshot = await eventsQuery.get();
+      eventsSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        // Filter out cancelled events
+        if (data.status === 'cancelled') return;
+        const startTime = data.start_time?.toDate?.() || new Date(data.start_time);
+        upcomingActivities.push({
+          id: doc.id,
+          type: 'event',
+          title: data.title || '',
+          description: data.description || '',
+          scheduledTime: startTime.toISOString(),
+          location: data.location || null
+        });
+      });
+    } catch (error) {
+      console.error('Error fetching upcoming events:', error);
+    }
+    
+    // Get upcoming reminders
+    try {
+      const remindersQuery = db.collection('reminders')
+        .where('userId', '==', userId)
+        .where('remind_at', '>=', nowTimestamp)
+        .where('remind_at', '<=', futureTimestamp);
+      const remindersSnapshot = await remindersQuery.get();
+      remindersSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        // Filter out cancelled reminders
+        if (data.status === 'cancelled') return;
+        const remindTime = data.remind_at?.toDate?.() || new Date(data.remind_at);
+        upcomingActivities.push({
+          id: doc.id,
+          type: 'reminder',
+          title: data.title || '',
+          description: data.description || '',
+          scheduledTime: remindTime.toISOString()
+        });
+      });
+    } catch (error) {
+      console.error('Error fetching upcoming reminders:', error);
+    }
+    
+    // Get upcoming tasks
+    try {
+      const tasksQuery = db.collection('tasks')
+        .where('userId', '==', userId)
+        .where('due_date', '>=', nowTimestamp)
+        .where('due_date', '<=', futureTimestamp);
+      const tasksSnapshot = await tasksQuery.get();
+      tasksSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        // Filter out cancelled tasks
+        if (data.status === 'cancelled' || !data.due_date) return;
+        const dueTime = data.due_date?.toDate?.() || new Date(data.due_date);
+        upcomingActivities.push({
+          id: doc.id,
+          type: 'task',
+          title: data.title || '',
+          description: data.description || '',
+          scheduledTime: dueTime.toISOString(),
+          priority: data.priority || 'normal'
+        });
+      });
+    } catch (error) {
+      console.error('Error fetching upcoming tasks:', error);
+    }
+    
+    res.json({ 
+      activities: upcomingActivities,
+      count: upcomingActivities.length
+    });
+  } catch (error) {
+    console.error('Error fetching upcoming activities:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch upcoming activities', 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
+// CHAT API ENDPOINTS
+// ============================================
+
+/**
+ * POST /api/chat
+ * Send a chat message to Deepseek AI and get a response
+ */
+app.post('/api/chat', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { messages, conversationId, userData, activities } = req.body;
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ 
+        error: 'Invalid request',
+        message: 'Messages array is required' 
+      });
+    }
+
+    // Check rate limits
+    const rateLimitError = await checkRateLimit(userId, 'deepseek');
+    if (rateLimitError) {
+      return res.status(429).json(rateLimitError);
+    }
+
+    // Get Deepseek API key
+    const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
+    if (!deepseekApiKey) {
+      return res.status(500).json({ 
+        error: 'Configuration error',
+        message: 'Deepseek API key not configured' 
+      });
+    }
+
+    // Build system context from user data and activities
+    let systemContext = 'You are MAI-PA, a helpful AI personal assistant.';
+    
+    if (userData) {
+      const userName = userData.fullName || userData.onboardingData?.userName || 'User';
+      const aiName = userData.onboardingData?.aiName || 'MAI';
+      systemContext += ` The user's name is ${userName}. The AI assistant is called ${aiName}.`;
+      
+      if (userData.onboardingData?.personality) {
+        systemContext += ` The assistant's personality: ${userData.onboardingData.personality}.`;
+      }
+    }
+
+    // Add activities context if available
+    if (activities) {
+      const eventsCount = activities.events?.length || 0;
+      const remindersCount = activities.reminders?.length || 0;
+      const tasksCount = activities.tasks?.length || 0;
+      
+      if (eventsCount > 0 || remindersCount > 0 || tasksCount > 0) {
+        systemContext += ` The user has ${eventsCount} events, ${remindersCount} reminders, and ${tasksCount} tasks.`;
+      }
+    }
+
+    // Prepare messages for Deepseek API
+    const apiMessages = [
+      {
+        role: 'system',
+        content: systemContext
+      },
+      ...messages.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }))
+    ];
+
+    // Call Deepseek API
+    const deepseekResponse = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${deepseekApiKey}`
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: apiMessages,
+        temperature: 0.7,
+        max_tokens: 2000
+      })
+    });
+
+    if (!deepseekResponse.ok) {
+      const errorData = await deepseekResponse.json().catch(() => ({}));
+      console.error('Deepseek API error:', errorData);
+      return res.status(deepseekResponse.status).json({ 
+        error: 'AI service error',
+        message: errorData.error?.message || 'Failed to get AI response' 
+      });
+    }
+
+    const data = await deepseekResponse.json();
+    const assistantMessage = data.choices?.[0]?.message?.content || 'I apologize, but I could not generate a response.';
+
+    // Record API usage
+    await recordAPIUsage(userId, 'deepseek', {
+      endpoint: '/api/chat',
+      conversationId: conversationId || null,
+      inputTokens: data.usage?.prompt_tokens || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+      totalTokens: data.usage?.total_tokens || 0
+    });
+
+    res.json({ 
+      message: assistantMessage,
+      usage: data.usage || {}
+    });
+  } catch (error) {
+    console.error('Error in chat endpoint:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * POST /api/tts
+ * Generate text-to-speech audio using ElevenLabs
+ */
+app.post('/api/tts', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { text, voiceId } = req.body;
+
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ 
+        error: 'Invalid request',
+        message: 'Text is required' 
+      });
+    }
+
+    if (!voiceId || typeof voiceId !== 'string') {
+      return res.status(400).json({ 
+        error: 'Invalid request',
+        message: 'Voice ID is required' 
+      });
+    }
+
+    // Check rate limits
+    const rateLimitError = await checkRateLimit(userId, 'elevenlabs');
+    if (rateLimitError) {
+      return res.status(429).json(rateLimitError);
+    }
+
+    // Get ElevenLabs API key
+    const elevenlabsApiKey = process.env.ELEVENLABS_API_KEY;
+    if (!elevenlabsApiKey) {
+      return res.status(500).json({ 
+        error: 'Configuration error',
+        message: 'ElevenLabs API key not configured' 
+      });
+    }
+
+    // Call ElevenLabs API
+    const elevenlabsResponse = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'xi-api-key': elevenlabsApiKey
+      },
+      body: JSON.stringify({
+        text: text,
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75
+        }
+      })
+    });
+
+    if (!elevenlabsResponse.ok) {
+      const errorData = await elevenlabsResponse.json().catch(() => ({}));
+      console.error('ElevenLabs API error:', errorData);
+      return res.status(elevenlabsResponse.status).json({ 
+        error: 'TTS service error',
+        message: errorData.detail?.message || errorData.message || 'Failed to generate audio' 
+      });
+    }
+
+    // Get audio as buffer
+    const audioBuffer = await elevenlabsResponse.arrayBuffer();
+    const audioBase64 = Buffer.from(audioBuffer).toString('base64');
+    const audioDataUrl = `data:audio/mpeg;base64,${audioBase64}`;
+
+    // Record API usage
+    await recordAPIUsage(userId, 'elevenlabs', {
+      endpoint: '/api/tts',
+      voiceId: voiceId,
+      textLength: text.length,
+      audioSize: audioBuffer.byteLength
+    });
+
+    res.json({ 
+      audio: audioDataUrl,
+      format: 'mp3'
+    });
+  } catch (error) {
+    console.error('Error in TTS endpoint:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
+// SCHEDULED NOTIFICATION JOB
+// ============================================
+
+/**
+ * POST /api/notifications/send-scheduled
+ * Send push notifications for activities scheduled in the next minute
+ * This endpoint should be called by a cron job every minute
+ * Can also be called manually for testing
+ */
+app.post('/api/notifications/send-scheduled', async (req, res) => {
+  try {
+    // Optional: Add API key authentication for cron jobs
+    const apiKey = req.headers['x-api-key'];
+    if (process.env.CRON_API_KEY && apiKey !== process.env.CRON_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    if (!webpush) {
+      return res.status(503).json({ 
+        error: 'Push notifications not configured',
+        message: 'web-push library not installed or VAPID keys not set' 
+      });
+    }
+
+    const now = new Date();
+    const oneMinuteFromNow = new Date(now.getTime() + 60000);
+    const nowTimestamp = admin.firestore.Timestamp.fromDate(now);
+    const futureTimestamp = admin.firestore.Timestamp.fromDate(oneMinuteFromNow);
+
+    let notificationsSent = 0;
+    let errors = [];
+
+    // Get all users (or you can optimize to only get users with push subscriptions)
+    const usersSnapshot = await db.collection('users').get();
+
+    for (const userDoc of usersSnapshot.docs) {
+      const userId = userDoc.id;
+      
+      try {
+        // Get user's push subscriptions
+        const subscriptionsSnapshot = await db.collection('users').doc(userId)
+          .collection('push_subscriptions').get();
+
+        if (subscriptionsSnapshot.empty) {
+          continue; // User has no push subscriptions
+        }
+
+        const subscriptions = subscriptionsSnapshot.docs.map(doc => ({
+          endpoint: doc.data().endpoint,
+          keys: doc.data().keys
+        }));
+
+        // Get upcoming events
+        let activities = [];
+        
+        try {
+          const eventsQuery = db.collection('events')
+            .where('userId', '==', userId)
+            .where('start_time', '>=', nowTimestamp)
+            .where('start_time', '<=', futureTimestamp);
+          const eventsSnapshot = await eventsQuery.get();
+          
+          eventsSnapshot.docs.forEach(doc => {
+            const data = doc.data();
+            if (data.status === 'cancelled') return;
+            const startTime = data.start_time?.toDate?.() || new Date(data.start_time);
+            activities.push({
+              id: doc.id,
+              type: 'event',
+              title: data.title || 'Event',
+              description: data.description || '',
+              scheduledTime: startTime,
+              location: data.location || null
+            });
+          });
+        } catch (error) {
+          console.error(`Error fetching events for user ${userId}:`, error);
+        }
+
+        // Get upcoming reminders
+        try {
+          const remindersQuery = db.collection('reminders')
+            .where('userId', '==', userId)
+            .where('remind_at', '>=', nowTimestamp)
+            .where('remind_at', '<=', futureTimestamp);
+          const remindersSnapshot = await remindersQuery.get();
+          
+          remindersSnapshot.docs.forEach(doc => {
+            const data = doc.data();
+            if (data.status === 'cancelled') return;
+            const remindTime = data.remind_at?.toDate?.() || new Date(data.remind_at);
+            activities.push({
+              id: doc.id,
+              type: 'reminder',
+              title: data.title || 'Reminder',
+              description: data.description || '',
+              scheduledTime: remindTime
+            });
+          });
+        } catch (error) {
+          console.error(`Error fetching reminders for user ${userId}:`, error);
+        }
+
+        // Get upcoming tasks
+        try {
+          const tasksQuery = db.collection('tasks')
+            .where('userId', '==', userId)
+            .where('due_date', '>=', nowTimestamp)
+            .where('due_date', '<=', futureTimestamp);
+          const tasksSnapshot = await tasksQuery.get();
+          
+          tasksSnapshot.docs.forEach(doc => {
+            const data = doc.data();
+            if (data.status === 'cancelled' || !data.due_date) return;
+            const dueTime = data.due_date?.toDate?.() || new Date(data.due_date);
+            activities.push({
+              id: doc.id,
+              type: 'task',
+              title: data.title || 'Task',
+              description: data.description || '',
+              scheduledTime: dueTime,
+              priority: data.priority || 'normal'
+            });
+          });
+        } catch (error) {
+          console.error(`Error fetching tasks for user ${userId}:`, error);
+        }
+
+        // Send push notification for each activity
+        for (const activity of activities) {
+          const notificationPayload = JSON.stringify({
+            title: activity.title,
+            body: activity.description || (activity.location ? `Location: ${activity.location}` : 'Time for your activity!'),
+            icon: '/favicon.ico',
+            badge: '/favicon.ico',
+            tag: `activity-${activity.id}`,
+            requireInteraction: activity.type === 'reminder',
+            url: `${process.env.FRONTEND_URL || 'https://your-domain.com'}/calendar`,
+            activityId: activity.id,
+            activityType: activity.type
+          });
+
+          // Send to all user's subscriptions
+          for (const subscription of subscriptions) {
+            try {
+              await webpush.sendNotification(
+                {
+                  endpoint: subscription.endpoint,
+                  keys: {
+                    p256dh: subscription.keys.p256dh,
+                    auth: subscription.keys.auth
+                  }
+                },
+                notificationPayload
+              );
+              notificationsSent++;
+            } catch (error) {
+              // If subscription is invalid, remove it
+              if (error.statusCode === 410 || error.statusCode === 404) {
+                const subscriptionId = subscription.endpoint.split('/').pop() || 'default';
+                await db.collection('users').doc(userId)
+                  .collection('push_subscriptions').doc(subscriptionId)
+                  .delete();
+                console.log(`Removed invalid subscription for user ${userId}`);
+              } else {
+                errors.push(`User ${userId}: ${error.message}`);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing user ${userId}:`, error);
+        errors.push(`User ${userId}: ${error.message}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      notificationsSent,
+      errors: errors.length > 0 ? errors : undefined,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error sending scheduled notifications:', error);
+    res.status(500).json({ 
+      error: 'Failed to send scheduled notifications', 
+      message: error.message 
+    });
   }
 });
 
