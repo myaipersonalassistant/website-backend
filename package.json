@@ -16,7 +16,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.2.4",
     "express": "^5.2.1",
-    "firebase-admin": "^13.6.1"
+    "firebase-admin": "^13.6.1",
+    "web-push": "^3.6.6"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
